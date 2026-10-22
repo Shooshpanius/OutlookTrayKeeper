@@ -401,23 +401,96 @@ namespace OutlookTrayKeeper
 
         private void ShowAbout()
         {
-            MessageBox.Show(
-                "OutlookTrayKeeper " + VERSION + "\n\n" +
-                "Нажатие [X] или Alt+F4 в классическом Outlook (outlook.exe)\n" +
-                "сворачивает окно в область уведомлений вместо закрытия.\n\n" +
-                "Вернуть окно: щелчок по значку Outlook в трее\n" +
-                "(или двойной щелчок по значку утилиты).\n\n" +
-                "Настоящий выход из Outlook:\n" +
-                "  • меню Outlook «Файл» → «Выход»;\n" +
-                "  • или меню этого значка → «Завершить Outlook…».\n\n" +
-                "Исходный код и обновления:\n" +
-                "github.com/Shooshpanius/OutlookTrayKeeper\n\n" +
-                "Утилита не изменяет сам Outlook: все её настройки обратимы\n" +
-                "и полностью удаляются вместе с программой.\n\n" +
-                "Если [X] не сворачивает окно:\n" +
-                "меню значка → «Открыть журнал диагностики» — в журнале видно,\n" +
-                "как перехватчик распознал последний клик (приложите его к письму).",
-                "О программе — OutlookTrayKeeper", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            // Небольшой диалог вместо MessageBox: в MessageBox гиперссылку
+            // сделать кликабельной нельзя, а в LinkLabel — можно.
+            using (Form f = new Form())
+            {
+                f.Text = "О программе — OutlookTrayKeeper";
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.StartPosition = FormStartPosition.CenterScreen;
+                f.MinimizeBox = false;
+                f.MaximizeBox = false;
+                f.ShowInTaskbar = false;
+                f.Font = SystemFonts.MessageBoxFont;
+                if (_tray != null) f.Icon = _tray.Icon;
+
+                Label top = new Label();
+                top.Text =
+                    "OutlookTrayKeeper " + VERSION + "\n\n" +
+                    "Нажатие [X] или Alt+F4 в классическом Outlook (outlook.exe)\n" +
+                    "сворачивает окно в область уведомлений вместо закрытия.\n\n" +
+                    "Вернуть окно: щелчок по значку Outlook в трее\n" +
+                    "(или двойной щелчок по значку утилиты).\n\n" +
+                    "Настоящий выход из Outlook:\n" +
+                    "  • меню Outlook «Файл» → «Выход»;\n" +
+                    "  • или меню этого значка → «Завершить Outlook…».\n\n" +
+                    "Исходный код и обновления:";
+                LinkLabel link = new LinkLabel();
+                link.Text = "github.com/Shooshpanius/OutlookTrayKeeper";
+                link.LinkClicked += delegate
+                {
+                    try { Process.Start("https://github.com/Shooshpanius/OutlookTrayKeeper"); }
+                    catch { }
+                };
+                Label bottom = new Label();
+                bottom.Text =
+                    "Утилита не изменяет сам Outlook: все её настройки обратимы\n" +
+                    "и полностью удаляются вместе с программой.\n\n" +
+                    "Если [X] не сворачивает окно:\n" +
+                    "меню значка → «Открыть журнал диагностики» — в журнале видно,\n" +
+                    "как перехватчик распознал последний клик (приложите его к письму).";
+                Button ok = new Button();
+                ok.Text = "OK";
+                ok.DialogResult = DialogResult.OK;
+                ok.AutoSize = true;
+
+                // Вёрстка по MeasureString: у LinkLabel с AutoSize бывают
+                // неверные расчёты высоты (ссылка наезжала на текст ниже),
+                // поэтому размеры всех блоков считаем сами. Высота — максимум
+                // из двух рендеров текста (GDI+ и GDI) плюс запас.
+                int width = 420;
+                top.AutoSize = false;
+                link.AutoSize = false;
+                bottom.AutoSize = false;
+                link.LinkArea = new LinkArea(0, link.Text.Length);
+                using (Graphics g = f.CreateGraphics())
+                {
+                    top.Size = TextBlockSize(g, top.Text, f.Font, width);
+                    link.Size = TextBlockSize(g, link.Text, f.Font, width - 28);   // x=42: правый край как у остальных
+                    bottom.Size = TextBlockSize(g, bottom.Text, f.Font, width);
+                }
+
+                int y = 14;
+                top.Location = new Point(14, y);
+                y += top.Height + 8;
+                link.Location = new Point(42, y);
+                y += link.Height + 8;
+                bottom.Location = new Point(14, y);
+                y += bottom.Height + 10;
+                ok.Location = new Point(width + 28 - 90, y);
+                f.ClientSize = new Size(width + 28, y + ok.PreferredSize.Height + 14);
+                f.AcceptButton = ok;
+                f.CancelButton = ok;
+
+                f.Controls.Add(top);
+                f.Controls.Add(link);
+                f.Controls.Add(bottom);
+                f.Controls.Add(ok);
+                f.ShowDialog();
+            }
+        }
+
+        /// <summary>
+        /// Размер текстового блока диалога: максимум из измерений GDI+
+        /// (Graphics.MeasureString) и GDI (TextRenderer — им рисует Label)
+        /// плюс небольшой запас, чтобы текст не обрезался.
+        /// </summary>
+        private static Size TextBlockSize(Graphics g, string text, Font font, int width)
+        {
+            SizeF sgdiPlus = g.MeasureString(text, font, width);
+            Size sgdi = TextRenderer.MeasureText(text, font,
+                new Size(width, int.MaxValue), TextFormatFlags.WordBreak);
+            return new Size(width, Math.Max((int)Math.Ceiling(sgdiPlus.Height), sgdi.Height) + 2);
         }
 
         private void QuitKeeper()
