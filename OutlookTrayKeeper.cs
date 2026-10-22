@@ -10,14 +10,26 @@
 //    • настоящий выход остаётся доступным: «Файл → Выход» в Outlook или
 //      «Завершить Outlook» в меню значка утилиты.
 //
+//  Версия 1.3 — клик по [X] не распознавался в двух случаях:
+//    (1) перехват сравнивал координаты только с ПЕРЕДНИМ окном, а активация
+//    происходит уже после нажатия кнопки, — клик по [X] неактивного окна
+//    Outlook игнорировался; теперь берётся окно ПОД КУРСОРОМ
+//    (WindowFromPoint + GetAncestor(GA_ROOT));
+//    (2) «запасная проверка по прямоугольнику кнопки» из v1.2 не работала
+//    никогда: прямоугольники кнопок есть только в структуре TITLEBARINFOEX
+//    (сообщение WM_GETTITLEBARINFOEX), а не в TITLEBARINFO, где этот массив
+//    отсутствует, — из-за лишнего поля cbSize не совпадал с настоящим.
+//    Теперь запасная проверка — полоса кнопок заголовка из данных DWM
+//    (DwmGetWindowAttribute/DWMWA_CAPTION_BUTTON_BOUNDS): она не требует
+//    ответа от самого окна и работает, даже если Outlook занят и не отвечает
+//    на WM_NCHITTEST.
+//
 //  Версия 1.2 — клик по [X] не распознавался на экранах с масштабированием
 //  (125% / 150% и т.п.): процесс без манифеста оставался DPI-unaware, Windows
 //  масштабировала для него координаты, и точка клика из хука не совпадала
 //  с координатами окна Outlook (Alt+F4 работал — координаты ему не нужны).
-//  Теперь при старте включается DPI-awareness, добавлена запасная проверка
-//  клика по прямоугольнику кнопки закрытия (GetTitleBarInfo) и журнал
-//  диагностики: меню значка → «Открыть журнал диагностики»
-//  (файл %TEMP%\OutlookTrayKeeper.log).
+//  Теперь при старте включается DPI-awareness и ведётся журнал диагностики:
+//  меню значка → «Открыть журнал диагностики» (файл %TEMP%\OutlookTrayKeeper.log).
 //
 //  Версия 1.1 — исправлено сравнение результата WM_NCHITTEST: код попадания
 //  приходит в out-параметре SendMessageTimeout (в v1.0 сравнивалось
@@ -49,7 +61,7 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("OutlookTrayKeeper")]
 [assembly: AssemblyProduct("OutlookTrayKeeper")]
 [assembly: AssemblyDescription("[X] and Alt+F4 minimize classic Outlook (outlook.exe) to the notification area instead of exiting")]
-[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
 
 namespace OutlookTrayKeeper
 {
@@ -131,7 +143,7 @@ namespace OutlookTrayKeeper
         private string _logPath;                  // %TEMP%\OutlookTrayKeeper.log
         private readonly object _logSync = new object();
         private int _lastWinCount = -1;
-        private const string VERSION = "1.2";
+        private const string VERSION = "1.3";
 
         public KeeperContext()
         {
@@ -449,42 +461,42 @@ namespace OutlookTrayKeeper
                     {
                         Native.MSLLHOOKSTRUCT ms =
                             (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
-                        IntPtr fg = Native.GetForegroundWindow();
-                        if (fg != IntPtr.Zero && IsOutlookMain(fg))
+                        // v1.3: проверяем окно ПОД КУРСОРОМ, а не переднее окно.
+                        // Активация происходит уже ПОСЛЕ нажатия кнопки: если
+                        // Outlook неактивен и пользователь щёлкает его [X],
+                        // в момент LBUTTONDOWN передним всё ещё является чужое
+                        // окно — v1.2 такой клик не проверяла вовсе.
+                        IntPtr target = Native.WindowFromPoint(ms.pt);
+                        if (target != IntPtr.Zero) target = Native.GetAncestor(target, Native.GA_ROOT);
+                        if (target != IntPtr.Zero && IsOutlookMain(target))
                         {
-                            // Куда попал клик? Две независимые проверки (v1.2):
+                            // Куда попал клик? Две независимые проверки:
                             //  1. хит-тест самого окна: WM_NCHITTEST -> HTCLOSE
-                            //     (результат приходит в out-параметре SendMessageTimeout;
-                            //     возвращаемое значение — лишь признак успеха отправки);
-                            //  2. прямоугольник кнопки закрытия из GetTitleBarInfo —
-                            //     обе величины в координатах нашего процесса, поэтому
-                            //     проверка не зависит от масштабирования экрана (DPI).
-                            // Кликом по [X] считаем попадание хотя бы по одной из них.
-                            int ht = Native.WindowHitTest(fg, ms.pt.X, ms.pt.Y);
+                            //     (код попадания приходит в out-параметре
+                            //     SendMessageTimeout; возвращаемое значение —
+                            //     лишь признак успеха отправки);
+                            //  2. если окно не ответило вовремя (занято/подвисло) —
+                            //     полоса кнопок заголовка из данных DWM:
+                            //     сообщениями с окном обмениваться не нужно,
+                            //     [X] — правая часть полосы.
+                            // Запасная проверка v1.2 через GetTitleBarInfo была
+                            // нерабочей: прямоугольники кнопок этот API не
+                            // заполняет (см. комментарий в Native).
+                            int ht = Native.WindowHitTest(target, ms.pt.X, ms.pt.Y);
                             bool htClose = (ht == Native.HTCLOSE);
-                            bool inClose = false;
-                            bool inTitle = false;
-                            if (!htClose && ht >= 0 && ht != Native.HTCLIENT)
+                            bool dwmClose = false;
+                            if (!htClose && ht == Native.HT_NO_ANSWER)
                             {
-                                // Запасную проверку делаем, только если окно только что
-                                // ответило на хит-тест (не зависло) и клик в зоне рамки.
-                                Native.TITLEBARINFO ti = new Native.TITLEBARINFO();
-                                ti.cbSize = Marshal.SizeOf(typeof(Native.TITLEBARINFO));
-                                ti.rgstate = new uint[6];
-                                ti.rgrect = new Native.RECT[6];
-                                bool tiOk = Native.GetTitleBarInfo(fg, ref ti);
-                                inTitle = tiOk && Native.RectContains(ti.rcTitleBar, ms.pt.X, ms.pt.Y);
-                                inClose = tiOk && (Native.RectContains(ti.rgrect[4], ms.pt.X, ms.pt.Y)
-                                    || Native.RectContains(ti.rgrect[5], ms.pt.X, ms.pt.Y));
+                                dwmClose = Native.DwmCloseRectContains(target, ms.pt.X, ms.pt.Y);
                             }
-                            if (htClose || inClose)
+                            if (htClose || dwmClose)
                             {
                                 // Это клик по [X]: сворачиваем Outlook в трей и глотаем клик,
                                 // чтобы команда закрытия вообще не дошла до окна.
                                 Log("клик по [X]: pt=(" + ms.pt.X + "," + ms.pt.Y + ") hittest=" + ht
-                                    + " по прямоугольнику кнопки=" + (inClose ? "да" : "нет")
+                                    + (dwmClose ? " (окно не ответило, запасная проверка DWM)" : "")
                                     + " -> свернуть в трей");
-                                Native.PostMessage(fg, Native.WM_SYSCOMMAND, Native.SC_MINIMIZE, IntPtr.Zero);
+                                Native.PostMessage(target, Native.WM_SYSCOMMAND, Native.SC_MINIMIZE, IntPtr.Zero);
                                 _suppressNextLButtonUp = true;
                                 return (IntPtr)1;
                             }
@@ -493,7 +505,7 @@ namespace OutlookTrayKeeper
                                 Log("клик: Outlook не ответил на хит-тест (занят), pt=("
                                     + ms.pt.X + "," + ms.pt.Y + ")");
                             }
-                            else if (inTitle || ht == Native.HTCAPTION)
+                            else if (ht == Native.HTCAPTION)
                             {
                                 Log("клик по заголовку (не [X]): pt=(" + ms.pt.X + "," + ms.pt.Y
                                     + ") hittest=" + ht + " -> пропущен");
@@ -932,7 +944,13 @@ namespace OutlookTrayKeeper
             return result;
         }
 
-        // --- v1.2: прямоугольник кнопок заголовка и DPI ---
+        // --- v1.3: окно под курсором и полоса кнопок заголовка (DWM) ---
+        // Прежний запасной способ (v1.2) — прямоугольники кнопок через
+        // GetTitleBarInfo — был нерабочим: в TITLEBARINFO массив rgrect
+        // отсутствует (прямоугольники заполняет только TITLEBARINFOEX по
+        // сообщению WM_GETTITLEBARINFOEX, и уже на Windows 11 его данные
+        // не соответствуют реальному расположению кнопок), а из-за лишнего
+        // поля объявленная структура не совпадала с настоящей по размеру.
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
@@ -943,25 +961,41 @@ namespace OutlookTrayKeeper
             public int Bottom;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        public struct TITLEBARINFO
-        {
-            public int cbSize;
-            public RECT rcTitleBar;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-            public uint[] rgstate;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
-            public RECT[] rgrect;
-        }
+        public const uint GA_ROOT = 2;
 
         [DllImport("user32.dll")]
-        public static extern bool GetTitleBarInfo(IntPtr hwnd, ref TITLEBARINFO pti);
+        public static extern IntPtr WindowFromPoint(POINT pt);
 
-        /// <summary>Точка внутри прямоугольника (включая левую/верхнюю границу).</summary>
-        public static bool RectContains(RECT r, int x, int y)
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        public const int DWMWA_CAPTION_BUTTON_BOUNDS = 5;
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out RECT rect, int cb);
+
+        /// <summary>
+        /// Запасная проверка клика по [X] без обмена сообщениями с окном:
+        /// полоса кнопок заголовка из данных DWM, [X] — её правая часть
+        /// (ширина кнопки ~1,6 высоты полосы: 46x30 px при 96 DPI).
+        /// Применяется, когда окно занято и не отвечает на WM_NCHITTEST.
+        /// </summary>
+        public static bool DwmCloseRectContains(IntPtr h, int x, int y)
         {
-            return r.Right > r.Left && r.Bottom > r.Top
-                && x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom;
+            RECT strip;
+            if (DwmGetWindowAttribute(h, DWMWA_CAPTION_BUTTON_BOUNDS, out strip,
+                Marshal.SizeOf(typeof(RECT))) != 0) return false;
+            RECT wr;
+            if (!GetWindowRect(h, out wr)) return false;
+            int height = strip.Bottom - strip.Top;
+            if (height <= 0 || strip.Right <= strip.Left) return false;
+            int right = wr.Left + strip.Right;
+            int left = right - (int)(height * 1.6);
+            return x >= left && x < right
+                && y >= wr.Top + strip.Top && y < wr.Top + strip.Bottom;
         }
 
         /// <summary>
