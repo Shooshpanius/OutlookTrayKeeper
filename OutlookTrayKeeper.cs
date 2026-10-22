@@ -10,6 +10,13 @@
 //    • настоящий выход остаётся доступным: «Файл → Выход» в Outlook или
 //      «Завершить Outlook» в меню значка утилиты.
 //
+//  Версия 1.4 — выяснилось, что РЕАЛЬНЫЙ классический Outlook отвечает на
+//  WM_NCHITTEST кодом HTCAPTION по всей полосе своих кнопок заголовка
+//  (включая [X]), поэтому основная проверка «hittest == HTCLOSE» на нём не
+//  срабатывала никогда — клик по [X] проходил мимо перехвата, а серая кнопка
+//  ничего не делала. Теперь правая треть полосы кнопок (по данным DWM)
+//  проверяется и в этом случае, а не только когда окно занято и не отвечает.
+//
 //  Версия 1.3 — клик по [X] не распознавался в двух случаях:
 //    (1) перехват сравнивал координаты только с ПЕРЕДНИМ окном, а активация
 //    происходит уже после нажатия кнопки, — клик по [X] неактивного окна
@@ -21,8 +28,7 @@
 //    отсутствует, — из-за лишнего поля cbSize не совпадал с настоящим.
 //    Теперь запасная проверка — полоса кнопок заголовка из данных DWM
 //    (DwmGetWindowAttribute/DWMWA_CAPTION_BUTTON_BOUNDS): она не требует
-//    ответа от самого окна и работает, даже если Outlook занят и не отвечает
-//    на WM_NCHITTEST.
+//    ответа от самого окна.
 //
 //  Версия 1.2 — клик по [X] не распознавался на экранах с масштабированием
 //  (125% / 150% и т.п.): процесс без манифеста оставался DPI-unaware, Windows
@@ -61,7 +67,7 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("OutlookTrayKeeper")]
 [assembly: AssemblyProduct("OutlookTrayKeeper")]
 [assembly: AssemblyDescription("[X] and Alt+F4 minimize classic Outlook (outlook.exe) to the notification area instead of exiting")]
-[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
 
 namespace OutlookTrayKeeper
 {
@@ -143,7 +149,7 @@ namespace OutlookTrayKeeper
         private string _logPath;                  // %TEMP%\OutlookTrayKeeper.log
         private readonly object _logSync = new object();
         private int _lastWinCount = -1;
-        private const string VERSION = "1.3";
+        private const string VERSION = "1.4";
 
         public KeeperContext()
         {
@@ -475,17 +481,22 @@ namespace OutlookTrayKeeper
                             //     (код попадания приходит в out-параметре
                             //     SendMessageTimeout; возвращаемое значение —
                             //     лишь признак успеха отправки);
-                            //  2. если окно не ответило вовремя (занято/подвисло) —
-                            //     полоса кнопок заголовка из данных DWM:
-                            //     сообщениями с окном обмениваться не нужно,
-                            //     [X] — правая часть полосы.
-                            // Запасная проверка v1.2 через GetTitleBarInfo была
-                            // нерабочей: прямоугольники кнопок этот API не
-                            // заполняет (см. комментарий в Native).
+                            //  2. правая часть полосы кнопок заголовка из
+                            //     данных DWM. Нужна в двух случаях:
+                            //      • окно занято и не ответило на хит-тест;
+                            //      • РЕАЛЬНЫЙ классический Outlook отвечает
+                            //        HTCAPTION на всю полосу своих кнопок
+                            //        (установлено по журналу v1.3: клики точно
+                            //        по [X] и по «свернуть» давали hittest=2),
+                            //        поэтому на нём HTCLOSE не приходит никогда.
+                            // Кнопки «свернуть»/«развернуть» эта проверка не
+                            // задевает: на обычных окнах хит-тест честно
+                            // отвечает HTMINBUTTON/HTMAXBUTTON, и до неё дело
+                            // не доходит.
                             int ht = Native.WindowHitTest(target, ms.pt.X, ms.pt.Y);
                             bool htClose = (ht == Native.HTCLOSE);
                             bool dwmClose = false;
-                            if (!htClose && ht == Native.HT_NO_ANSWER)
+                            if (!htClose && (ht == Native.HTCAPTION || ht == Native.HT_NO_ANSWER))
                             {
                                 dwmClose = Native.DwmCloseRectContains(target, ms.pt.X, ms.pt.Y);
                             }
@@ -494,7 +505,9 @@ namespace OutlookTrayKeeper
                                 // Это клик по [X]: сворачиваем Outlook в трей и глотаем клик,
                                 // чтобы команда закрытия вообще не дошла до окна.
                                 Log("клик по [X]: pt=(" + ms.pt.X + "," + ms.pt.Y + ") hittest=" + ht
-                                    + (dwmClose ? " (окно не ответило, запасная проверка DWM)" : "")
+                                    + (dwmClose ? (ht == Native.HT_NO_ANSWER
+                                        ? " (окно не ответило, запасная проверка DWM)"
+                                        : " (кнопки заголовка отвечают HTCAPTION, полоса кнопок DWM)") : "")
                                     + " -> свернуть в трей");
                                 Native.PostMessage(target, Native.WM_SYSCOMMAND, Native.SC_MINIMIZE, IntPtr.Zero);
                                 _suppressNextLButtonUp = true;
@@ -978,10 +991,12 @@ namespace OutlookTrayKeeper
         public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out RECT rect, int cb);
 
         /// <summary>
-        /// Запасная проверка клика по [X] без обмена сообщениями с окном:
-        /// полоса кнопок заголовка из данных DWM, [X] — её правая часть
-        /// (ширина кнопки ~1,6 высоты полосы: 46x30 px при 96 DPI).
-        /// Применяется, когда окно занято и не отвечает на WM_NCHITTEST.
+        /// Проверка клика по [X] без опоры на ответ окна: полоса кнопок
+        /// заголовка из данных DWM, [X] — её правая треть (ширина одной
+        /// кнопки). Полоса в координатах, относительных окну; DWM отдаёт
+        /// её даже, когда окно занято, не отвечает на сообщения или
+        /// подменяет хит-тест заголовка (реальный Outlook отвечает
+        /// HTCAPTION на всю полосу кнопок).
         /// </summary>
         public static bool DwmCloseRectContains(IntPtr h, int x, int y)
         {
@@ -990,10 +1005,11 @@ namespace OutlookTrayKeeper
                 Marshal.SizeOf(typeof(RECT))) != 0) return false;
             RECT wr;
             if (!GetWindowRect(h, out wr)) return false;
+            int width = strip.Right - strip.Left;
             int height = strip.Bottom - strip.Top;
-            if (height <= 0 || strip.Right <= strip.Left) return false;
+            if (width <= 0 || height <= 0) return false;
             int right = wr.Left + strip.Right;
-            int left = right - (int)(height * 1.6);
+            int left = right - width / 3;   // ширина одной кнопки ~ трети полосы
             return x >= left && x < right
                 && y >= wr.Top + strip.Top && y < wr.Top + strip.Bottom;
         }
