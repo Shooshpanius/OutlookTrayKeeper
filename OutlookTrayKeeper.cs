@@ -10,6 +10,14 @@
 //    • настоящий выход остаётся доступным: «Файл → Выход» в Outlook или
 //      «Завершить Outlook» в меню значка утилиты.
 //
+//  Версия 1.5 — перехват и «серый [X]» распространялись и на дочерние окна
+//  Outlook — окна писем, открытые отдельно: класс rctrl_renwnd32 общий у
+//  главного окна (проводника) и у окон писем, и утилита их не различала.
+//  Теперь обрабатывается только главное окно: у него список сообщений —
+//  дочерний контрол класса SUPERGRID, а заголовок заканчивается на имя
+//  приложения («… - Outlook»). У окон писем кнопка [X] работает как обычно;
+//  если старая версия успела её погасить, утилита возвращает активный вид.
+//
 //  Версия 1.4 — выяснилось, что РЕАЛЬНЫЙ классический Outlook отвечает на
 //  WM_NCHITTEST кодом HTCAPTION по всей полосе своих кнопок заголовка
 //  (включая [X]), поэтому основная проверка «hittest == HTCLOSE» на нём не
@@ -67,7 +75,7 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("OutlookTrayKeeper")]
 [assembly: AssemblyProduct("OutlookTrayKeeper")]
 [assembly: AssemblyDescription("[X] and Alt+F4 minimize classic Outlook (outlook.exe) to the notification area instead of exiting")]
-[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
 
 namespace OutlookTrayKeeper
 {
@@ -149,7 +157,7 @@ namespace OutlookTrayKeeper
         private string _logPath;                  // %TEMP%\OutlookTrayKeeper.log
         private readonly object _logSync = new object();
         private int _lastWinCount = -1;
-        private const string VERSION = "1.4";
+        private const string VERSION = "1.5";
 
         public KeeperContext()
         {
@@ -650,7 +658,7 @@ namespace OutlookTrayKeeper
             return (Native.GetAsyncKeyState((int)vk) & 0x8000) != 0;
         }
 
-        /// <summary>Главное ли это окно Outlook (класс + pid + наличие кнопок свернуть/развернуть).</summary>
+        /// <summary>Главное ли это окно Outlook (класс + pid + маркеры главного окна).</summary>
         private bool IsOutlookMain(IntPtr h)
         {
             if (h == IntPtr.Zero || _outlookPids.Count == 0) return false;
@@ -663,6 +671,9 @@ namespace OutlookTrayKeeper
                 Native.GetClassName(h, sb, 64);
                 if (sb.ToString() != OUTLOOK_CLASS) return false;
                 if (!Native.IsMainStyleWindow(h)) return false;
+                // v1.5: класс rctrl_renwnd32 общий у главного окна и у окон
+                // писем, открываемых отдельно, — различаем по маркерам главного
+                if (!Native.LooksLikeMainOutlookWindow(h)) return false;
             }
             return true;
         }
@@ -682,14 +693,35 @@ namespace OutlookTrayKeeper
                 finally { p.Dispose(); }
             }
 
-            // Их главные окна
-            _windows = Native.FindOutlookWindows(_outlookPids);
+            // Их окна класса rctrl_renwnd32: этот класс общий у главного окна
+            // (проводника) и у окон писем — различаем по маркерам главного окна
+            List<IntPtr> mains = new List<IntPtr>();
+            List<IntPtr> others = new List<IntPtr>();
+            Native.FindOutlookWindows(_outlookPids, mains, others);
+            _windows = mains;
             _mainHwnd = IntPtr.Zero;
             foreach (IntPtr h in _windows)
             {
                 if (Native.IsWindowVisible(h)) { _mainHwnd = h; break; }
             }
             if (_mainHwnd == IntPtr.Zero && _windows.Count > 0) _mainHwnd = _windows[0];
+
+            // Самовосстановление: у окон писем кнопка [X] должна быть активной;
+            // если её погасили (например, версией до 1.5), возвращаем обычный вид
+            foreach (IntPtr h in others)
+            {
+                IntPtr hSys = Native.GetSystemMenu(h, false);
+                if (hSys == IntPtr.Zero) continue;
+                int st = Native.GetMenuState(hSys, Native.SC_CLOSE, (int)Native.MF_BYCOMMAND);
+                if ((st & 3) != 0)
+                {
+                    Native.EnableMenuItem(hSys, Native.SC_CLOSE, Native.MF_BYCOMMAND | Native.MF_ENABLED);
+                    Native.SetWindowPos(h, IntPtr.Zero, 0, 0, 0, 0,
+                        Native.SWP_NOSIZE | Native.SWP_NOMOVE | Native.SWP_NOZORDER
+                        | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+                    Log("окно письма: кнопка [X] была погашена — возвращён активный вид");
+                }
+            }
 
             // Чистим «мертвые» окна из списка серых [X]
             for (int i = _grayed.Count - 1; i >= 0; i--)
@@ -722,7 +754,7 @@ namespace OutlookTrayKeeper
             {
                 _lastWinCount = _windows.Count;
                 Log("состояние Outlook: процессов=" + _outlookPids.Count
-                    + ", главных окон=" + _windows.Count);
+                    + ", главных окон=" + _windows.Count + ", окон писем=" + others.Count);
             }
 
             UpdateMenuState();
@@ -1010,11 +1042,14 @@ namespace OutlookTrayKeeper
             return (style & required) == required;
         }
 
-        /// <summary>Найти все главные окна Outlook (класс rctrl_renwnd32) по списку PID.</summary>
-        public static List<IntPtr> FindOutlookWindows(HashSet<uint> pids)
+        /// <summary>
+        /// Найти окна Outlook: main — главные окна (проводник), others — прочие
+        /// окна того же класса rctrl_renwnd32 (окна писем и т.п.), их утилита
+        /// не трогает.
+        /// </summary>
+        public static void FindOutlookWindows(HashSet<uint> pids, List<IntPtr> main, List<IntPtr> others)
         {
-            List<IntPtr> result = new List<IntPtr>();
-            if (pids == null || pids.Count == 0) return result;
+            if (pids == null || pids.Count == 0) return;
             EnumWindowsProc proc = delegate(IntPtr h, IntPtr l)
             {
                 uint pid;
@@ -1024,12 +1059,62 @@ namespace OutlookTrayKeeper
                 GetClassName(h, sb, 64);
                 if (sb.ToString() != "rctrl_renwnd32") return true;
                 if (!IsMainStyleWindow(h)) return true;
-                result.Add(h);
+                if (LooksLikeMainOutlookWindow(h)) main.Add(h);
+                else others.Add(h);
                 return true;
             };
             EnumWindows(proc, IntPtr.Zero);
             GC.KeepAlive(proc);
-            return result;
+        }
+
+        /// <summary>
+        /// Похоже ли окно на ГЛАВНОЕ окно Outlook, а не на окно письма.
+        /// Класс rctrl_renwnd32 у них общий, поэтому смотрим на два надёжных
+        /// признака главного окна (проводника):
+        ///  • заголовок заканчивается именем приложения: «Папка - Outlook»
+        ///    (у окон писем в заголовке тема письма);
+        ///  • в главном окне есть список сообщений — дочерний контрол
+        ///    класса SUPERGRID (у окна письма его нет).
+        /// </summary>
+        public static bool LooksLikeMainOutlookWindow(IntPtr h)
+        {
+            StringBuilder sb = new StringBuilder(256);
+            GetWindowText(h, sb, 256);
+            if (sb.ToString().TrimEnd().EndsWith("Outlook", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            return HasDescendantClass(h, "SUPERGRID");
+        }
+
+        public delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumChildWindows(IntPtr hWnd, EnumChildProc lpEnumFunc, IntPtr lParam);
+
+        /// <summary>Есть ли у окна дочернее окно указанного класса (на любой глубине).</summary>
+        public static bool HasDescendantClass(IntPtr h, string className)
+        {
+            bool found = false;
+            EnumChildProc walk = null;
+            walk = delegate(IntPtr c, IntPtr l)
+            {
+                StringBuilder sb = new StringBuilder(64);
+                GetClassName(c, sb, 64);
+                if (sb.ToString() == className)
+                {
+                    found = true;
+                    return false;
+                }
+                EnumChildWindows(c, walk, IntPtr.Zero);   // вглубь
+                return !found;
+            };
+            EnumChildWindows(h, walk, IntPtr.Zero);
+            GC.KeepAlive(walk);
+            return found;
         }
 
         // --- v1.3: окно под курсором и полоса кнопок заголовка (DWM) ---
